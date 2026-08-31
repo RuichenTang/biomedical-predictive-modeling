@@ -1,0 +1,11 @@
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user/
+renv/library/
+analysis/*_cache/
+analysis/*_files/
+
+# Download separately; see data/README.md
+data/METABRIC_RNA_Mutation.csv
+
