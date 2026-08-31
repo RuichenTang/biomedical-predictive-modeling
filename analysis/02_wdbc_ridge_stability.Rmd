@@ -1,0 +1,187 @@
+---
+title: "Wisconsin Breast Cancer: Selection Stability and Ridge Logistic Regression"
+author: "Ruichen Tang"
+output:
+  html_document:
+    toc: true
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+set.seed(527)
+```
+
+## Objective
+
+Measure how correlated predictors affect stepwise selection stability, then fit a ridge logistic model that shrinks all coefficients jointly.
+
+```{r packages}
+library(MASS)
+library(glmnet)
+library(caret)
+library(corrplot)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(knitr)
+```
+
+## Data preparation
+
+```{r data}
+data_path <- file.path("..", "data", "breast_cancer_wisconsin.csv")
+breast_cancer <- read.csv(data_path, check.names = FALSE)
+
+breast_cancer$diagnosis <- factor(
+  breast_cancer$diagnosis,
+  levels = c("B", "M")
+)
+breast_cancer$id <- NULL
+breast_cancer$X <- NULL
+
+set.seed(527)
+train_index <- createDataPartition(
+  breast_cancer$diagnosis,
+  p = 0.60,
+  list = FALSE
+)
+
+train_data <- breast_cancer[train_index, ]
+test_data <- breast_cancer[-train_index, ]
+
+data.frame(
+  split = c("Train", "Test"),
+  rows = c(nrow(train_data), nrow(test_data)),
+  malignant_rate = c(
+    mean(train_data$diagnosis == "M"),
+    mean(test_data$diagnosis == "M")
+  )
+) |> kable(digits = 3)
+```
+
+## Correlation structure
+
+```{r correlation, fig.width=10, fig.height=9}
+x_train <- model.matrix(diagnosis ~ ., data = train_data)[, -1]
+y_train <- train_data$diagnosis
+x_test <- model.matrix(diagnosis ~ ., data = test_data)[, -1]
+y_test <- test_data$diagnosis
+
+corrplot(
+  cor(x_train),
+  method = "color",
+  type = "upper",
+  tl.cex = 0.55,
+  tl.col = "black",
+  title = "Predictor Correlation Matrix",
+  mar = c(0, 0, 2, 0)
+)
+```
+
+## Ridge logistic regression
+
+```{r ridge, fig.width=7, fig.height=5}
+set.seed(527)
+ridge_cv <- cv.glmnet(
+  x = x_train,
+  y = y_train,
+  family = "binomial",
+  alpha = 0,
+  nfolds = 10,
+  standardize = TRUE
+)
+
+plot(ridge_cv)
+
+ridge_class <- predict(
+  ridge_cv,
+  newx = x_test,
+  s = "lambda.min",
+  type = "class"
+)
+
+ridge_accuracy <- mean(as.vector(ridge_class) == as.character(y_test))
+
+data.frame(
+  lambda_min = ridge_cv$lambda.min,
+  lambda_1se = ridge_cv$lambda.1se,
+  test_accuracy = ridge_accuracy
+) |> kable(digits = 4)
+```
+
+## Bootstrap stability of stepwise selection
+
+The calculation records failed bootstrap fits as missing rather than incorrectly treating every variable as unselected.
+
+```{r bootstrap}
+set.seed(527)
+n_boot <- 100
+variables <- setdiff(names(train_data), "diagnosis")
+
+aic_selected <- matrix(
+  NA_real_, nrow = n_boot, ncol = length(variables),
+  dimnames = list(NULL, variables)
+)
+bic_selected <- aic_selected
+
+for (iteration in seq_len(n_boot)) {
+  bootstrap_index <- sample(seq_len(nrow(train_data)), replace = TRUE)
+  bootstrap_data <- train_data[bootstrap_index, ]
+
+  tryCatch({
+    full_logistic <- glm(
+      diagnosis ~ ., data = bootstrap_data, family = "binomial"
+    )
+
+    aic_fit <- suppressWarnings(
+      stepAIC(full_logistic, direction = "both", trace = FALSE)
+    )
+    bic_fit <- suppressWarnings(
+      stepAIC(
+        full_logistic,
+        direction = "both",
+        k = log(nrow(bootstrap_data)),
+        trace = FALSE
+      )
+    )
+
+    aic_selected[iteration, ] <- 0
+    bic_selected[iteration, ] <- 0
+    aic_selected[iteration, variables %in% names(coef(aic_fit))] <- 1
+    bic_selected[iteration, variables %in% names(coef(bic_fit))] <- 1
+  }, error = function(error) NULL)
+}
+
+selection_frequency <- data.frame(
+  variable = variables,
+  AIC = colMeans(aic_selected, na.rm = TRUE) * 100,
+  BIC = colMeans(bic_selected, na.rm = TRUE) * 100
+) |>
+  arrange(desc(AIC)) |>
+  pivot_longer(c(AIC, BIC), names_to = "method", values_to = "frequency")
+```
+
+```{r stability-plot, fig.width=11, fig.height=6}
+ggplot(
+  selection_frequency,
+  aes(x = reorder(variable, -frequency), y = frequency, fill = method)
+) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = c(AIC = "#2166AC", BIC = "#B2182B")) +
+  coord_cartesian(ylim = c(0, 100)) +
+  labs(
+    title = "Bootstrap Selection Frequency",
+    x = NULL,
+    y = "Selection frequency (%)",
+    fill = "Criterion"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    axis.text.x = element_text(angle = 55, hjust = 1, size = 7),
+    legend.position = "bottom"
+  )
+```
+
+Correlated predictors can substitute for one another across resamples, so unstable inclusion should not be interpreted as proof that a feature is unimportant. Ridge addresses a different objective: it stabilizes prediction through continuous shrinkage rather than discrete selection.
+

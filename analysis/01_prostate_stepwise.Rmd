@@ -1,0 +1,103 @@
+---
+title: "Prostate Cancer: Stepwise AIC and BIC"
+author: "Ruichen Tang"
+output:
+  html_document:
+    toc: true
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+## Objective
+
+Compare the full eight-predictor linear model with models selected using AIC and BIC, then evaluate all three specifications on the recommended held-out test set.
+
+```{r packages}
+library(MASS)
+library(knitr)
+```
+
+## Data preparation
+
+```{r data}
+prostate_url <- "https://hastie.su.domains/ElemStatLearn/datasets/prostate.data"
+prostate <- read.table(prostate_url, header = TRUE)
+
+train_data <- subset(prostate, train == TRUE)
+test_data <- subset(prostate, train == FALSE)
+train_data$train <- NULL
+test_data$train <- NULL
+
+c(train_rows = nrow(train_data), test_rows = nrow(test_data))
+```
+
+## Full model and influence diagnostics
+
+```{r full-model}
+full_model <- lm(
+  lpsa ~ lcavol + lweight + age + lbph + svi + lcp + gleason + pgg45,
+  data = train_data
+)
+
+summary(full_model)
+```
+
+```{r diagnostics, fig.width=8, fig.height=7}
+par(mfrow = c(2, 2))
+plot(full_model)
+par(mfrow = c(1, 1))
+
+cook_distance <- cooks.distance(full_model)
+data.frame(
+  observation = which(cook_distance > 4 / length(cook_distance)),
+  cooks_distance = cook_distance[cook_distance > 4 / length(cook_distance)]
+)
+```
+
+## Stepwise selection
+
+```{r selection}
+aic_model <- stepAIC(full_model, direction = "both", trace = FALSE)
+bic_model <- stepAIC(
+  full_model,
+  direction = "both",
+  k = log(nrow(train_data)),
+  trace = FALSE
+)
+
+selected_terms <- data.frame(
+  model = c("Full", "AIC", "BIC"),
+  predictors = c(
+    paste(names(coef(full_model))[-1], collapse = ", "),
+    paste(names(coef(aic_model))[-1], collapse = ", "),
+    paste(names(coef(bic_model))[-1], collapse = ", ")
+  )
+)
+kable(selected_terms)
+```
+
+## Held-out comparison
+
+```{r evaluation}
+models <- list(Full = full_model, AIC = aic_model, BIC = bic_model)
+
+metrics <- do.call(rbind, lapply(names(models), function(model_name) {
+  model <- models[[model_name]]
+  predictions <- predict(model, newdata = test_data)
+  data.frame(
+    model = model_name,
+    predictors = length(coef(model)) - 1,
+    train_r_squared = summary(model)$r.squared,
+    test_mse = mean((test_data$lpsa - predictions)^2),
+    test_rmse = sqrt(mean((test_data$lpsa - predictions)^2))
+  )
+}))
+
+kable(metrics, digits = 3)
+```
+
+The comparison illustrates the central tradeoff: AIC retains a relatively rich specification, whereas BIC applies a stronger complexity penalty and selects a two-variable model. In the original course run, the BIC specification achieved the lowest test MSE despite its lower training R².
+

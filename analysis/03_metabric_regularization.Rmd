@@ -1,0 +1,226 @@
+---
+title: "METABRIC: Ridge versus Lasso"
+author: "Angel Li"
+output:
+  html_document:
+    toc: true
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+set.seed(527)
+```
+
+## Objective
+
+Compare ridge and lasso for predicting Nottingham Prognostic Index (NPI) in a high-dimensional setting, using the same train/test split and the same cross-validation folds for both methods.
+
+```{r packages}
+library(glmnet)
+library(caret)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(knitr)
+```
+
+## Data preparation
+
+```{r data}
+data_path <- file.path("..", "data", "METABRIC_RNA_Mutation.csv")
+
+if (!file.exists(data_path)) {
+  stop(
+    "METABRIC_RNA_Mutation.csv was not found. Follow data/README.md, ",
+    "then place the file in the data directory."
+  )
+}
+
+raw_data <- read.csv(data_path, check.names = FALSE)
+
+# Reproduce the course project's complete-case filtering, then retain numeric
+# modeling fields. This produces the same candidate-predictor definition used
+# in the final report.
+model_data <- raw_data |>
+  mutate(across(where(is.character), ~ na_if(.x, ""))) |>
+  drop_na() |>
+  select(where(is.numeric)) |>
+  select(
+    -any_of(c(
+      "patient_id", "cohort", "tumor_size",
+      "lymph_nodes_examined_positive", "neoplasm_histologic_grade"
+    ))
+  )
+
+stopifnot("nottingham_prognostic_index" %in% names(model_data))
+
+set.seed(527)
+train_index <- createDataPartition(
+  model_data$nottingham_prognostic_index,
+  p = 0.70,
+  list = FALSE
+)
+
+training <- model_data[train_index, ]
+testing <- model_data[-train_index, ]
+
+x_train <- training |>
+  select(-nottingham_prognostic_index) |>
+  as.matrix()
+y_train <- training$nottingham_prognostic_index
+x_test <- testing |>
+  select(-nottingham_prognostic_index) |>
+  as.matrix()
+y_test <- testing$nottingham_prognostic_index
+
+data.frame(
+  complete_cases = nrow(model_data),
+  candidate_predictors = ncol(x_train),
+  training_rows = nrow(x_train),
+  testing_rows = nrow(x_test)
+) |> kable()
+```
+
+## Cross-validation and model fitting
+
+```{r models, fig.width=10, fig.height=5}
+set.seed(527)
+fold_id <- sample(rep(seq_len(10), length.out = nrow(x_train)))
+
+ridge_cv <- cv.glmnet(
+  x_train, y_train,
+  alpha = 0,
+  foldid = fold_id,
+  standardize = TRUE
+)
+lasso_cv <- cv.glmnet(
+  x_train, y_train,
+  alpha = 1,
+  foldid = fold_id,
+  standardize = TRUE
+)
+
+par(mfrow = c(1, 2))
+plot(ridge_cv, main = "Ridge: Cross-Validation")
+plot(lasso_cv, main = "Lasso: Cross-Validation")
+par(mfrow = c(1, 1))
+
+ridge_model <- glmnet(
+  x_train, y_train,
+  alpha = 0,
+  lambda = ridge_cv$lambda.min,
+  standardize = TRUE
+)
+lasso_model <- glmnet(
+  x_train, y_train,
+  alpha = 1,
+  lambda = lasso_cv$lambda.min,
+  standardize = TRUE
+)
+```
+
+## Held-out performance
+
+```{r evaluation}
+score_model <- function(model, x_train, y_train, x_test, y_test) {
+  train_prediction <- as.vector(predict(model, newx = x_train))
+  test_prediction <- as.vector(predict(model, newx = x_test))
+
+  data.frame(
+    train_rmse = sqrt(mean((y_train - train_prediction)^2)),
+    test_rmse = sqrt(mean((y_test - test_prediction)^2)),
+    train_r_squared = 1 - sum((y_train - train_prediction)^2) /
+      sum((y_train - mean(y_train))^2),
+    test_r_squared = 1 - sum((y_test - test_prediction)^2) /
+      sum((y_test - mean(y_test))^2),
+    generalization_gap_mse =
+      mean((y_test - test_prediction)^2) -
+      mean((y_train - train_prediction)^2)
+  )
+}
+
+metrics <- bind_rows(
+  Ridge = score_model(ridge_model, x_train, y_train, x_test, y_test),
+  Lasso = score_model(lasso_model, x_train, y_train, x_test, y_test),
+  .id = "model"
+)
+
+kable(metrics, digits = 3)
+```
+
+The train-test MSE gap is reported only as a generalization diagnostic. It is not a formal estimate of variance, and training MSE is not treated as an estimate of squared bias.
+
+## Sparsity and selected predictors
+
+```{r sparsity}
+ridge_coefficients <- as.matrix(coef(ridge_model))
+lasso_coefficients <- as.matrix(coef(lasso_model))
+
+complexity <- data.frame(
+  model = c("Ridge", "Lasso"),
+  nonzero_predictors = c(
+    sum(ridge_coefficients[-1, 1] != 0),
+    sum(lasso_coefficients[-1, 1] != 0)
+  )
+)
+kable(complexity)
+
+selected_lasso <- data.frame(
+  predictor = rownames(lasso_coefficients)[-1],
+  coefficient = lasso_coefficients[-1, 1]
+) |>
+  filter(coefficient != 0) |>
+  arrange(desc(abs(coefficient)))
+
+kable(head(selected_lasso, 20), digits = 4)
+```
+
+```{r metric-plot, fig.width=9, fig.height=5}
+rmse_plot_data <- metrics |>
+  select(model, train_rmse, test_rmse) |>
+  pivot_longer(-model, names_to = "split", values_to = "rmse")
+
+ggplot(rmse_plot_data, aes(split, rmse, fill = model)) +
+  geom_col(position = "dodge", width = 0.7) +
+  geom_text(
+    aes(label = round(rmse, 3)),
+    position = position_dodge(width = 0.7),
+    vjust = -0.35
+  ) +
+  scale_fill_manual(values = c(Ridge = "#3B82F6", Lasso = "#BE3455")) +
+  labs(title = "RMSE by Model and Split", x = NULL, y = "RMSE") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+```
+
+```{r predicted-actual, fig.width=10, fig.height=5}
+prediction_data <- bind_rows(
+  data.frame(
+    actual = y_test,
+    predicted = as.vector(predict(ridge_model, newx = x_test)),
+    model = "Ridge"
+  ),
+  data.frame(
+    actual = y_test,
+    predicted = as.vector(predict(lasso_model, newx = x_test)),
+    model = "Lasso"
+  )
+)
+
+ggplot(prediction_data, aes(actual, predicted, color = model)) +
+  geom_point(alpha = 0.55) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed") +
+  facet_wrap(~ model) +
+  scale_color_manual(values = c(Ridge = "#3B82F6", Lasso = "#BE3455")) +
+  labs(
+    title = "Predicted versus Actual Nottingham Prognostic Index",
+    x = "Actual NPI",
+    y = "Predicted NPI"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none")
+```
+
+Lasso's non-zero coefficients identify predictive associations under this modeling specification. They should not be interpreted as causal effects or clinically validated biomarkers.
+
